@@ -15,9 +15,9 @@ If missing, slycer can install them for you (`--yes`).
 
 ## Install
 ```bash
+cargo install slycer
+# or if you have source code locally
 cargo install --path .
-# or build locally
-cargo build --release
 ```
 
 ## Usage
