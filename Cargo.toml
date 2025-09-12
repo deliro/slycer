@@ -1,0 +1,19 @@
+[package]
+name = "slycer"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "YouTube audio downloader and chapter-based splitter"
+repository = "https://github.com/deliro/slycer"
+homepage = "https://github.com/deliro/slycer"
+readme = "README.md"
+keywords = ["youtube", "audio", "split", "chapters", "ffmpeg"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+anyhow = "1.0.98"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = { version = "1.0.140", features = ["alloc"] }
+clap = { version = "4.5.20", features = ["derive"] }
+indicatif = "0.17.8"
+which = "6.0.3"
