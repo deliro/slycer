@@ -181,70 +181,123 @@ fn download_and_split(mp: &MultiProgress, cli: &Cli, url: &str) -> Result<()> {
     json_spinner.finish_and_clear();
     // no top white logs
 
-    let chapters = extract_chapters(&metadata)?;
+    let chapters = extract_chapters(&metadata).unwrap_or_default();
+
     if chapters.is_empty() {
-        bail!("No chapters found in the video metadata");
-    }
+        // No chapters: convert entire video to single MP3
+        let convert_bar = mp.add(ProgressBar::new_spinner());
+        if let Ok(style) =
+            ProgressStyle::with_template("{spinner:.green} \x1b[90m{elapsed_precise}\x1b[0m {msg}")
+        {
+            convert_bar.set_style(style.progress_chars("#>-"));
+        }
+        convert_bar.enable_steady_tick(Duration::from_millis(100));
+        convert_bar.set_message("Converting entire video to MP3");
 
-    let total = u64::try_from(chapters.len()).unwrap_or(u64::MAX);
-    let split_bar = mp.add(ProgressBar::new(total));
-    if let Ok(style) = ProgressStyle::with_template(
-        "{spinner:.green} \x1b[90m{elapsed_precise}\x1b[0m [{bar:40.cyan/blue}] {pos}/{len} {msg}",
-    ) {
-        split_bar.set_style(style.progress_chars("#>-"));
-    }
-    split_bar.set_message("Splitting audio");
+        if let Some(ref dest_dir) = cli.dest {
+            fs::create_dir_all(dest_dir).context("Failed to create destination directory")?;
+        }
 
-    if let Some(ref dest_dir) = cli.dest {
-        fs::create_dir_all(dest_dir).context("Failed to create destination directory")?;
-    }
+        // Generate filename from video title, ignoring --prefix-name
+        let title_prefix = metadata
+            .get("title")
+            .and_then(|t| t.as_str())
+            .and_then(make_title_prefix)
+            .unwrap_or_else(|| "untitled".to_string());
 
-    let pad_width = compute_pad_width(cli.numbers, chapters.len());
-
-    for (index, ch) in chapters.iter().enumerate() {
-        let safe_title = sanitize(&ch.title).unwrap_or_else(|| format!("part-{}", index + 1));
-        let title_prefix = if cli.prefix_name {
-            make_title_prefix(&metadata)
+        let filename = if let Some(ref prefix) = cli.prefix {
+            format!("{}_{}.{}", prefix, title_prefix, cli.audio_format)
         } else {
-            None
+            format!("{}.{}", title_prefix, cli.audio_format)
         };
-        let filename =
-            build_output_filename(cli, index, pad_width, &safe_title, title_prefix.as_deref());
+
         let out_path = match &cli.dest {
             Some(dir) => dir.join(filename),
             None => PathBuf::from(&filename),
         };
 
-        let start = ch.start_time.max(0.0);
-        let duration = (ch.end_time - ch.start_time).max(0.0);
-        if !duration.is_finite() || duration < 1.0 {
-            split_bar.println(format!(
-                "\x1b[90mSkipping '{}' (<1s duration)\x1b[0m",
-                ch.title
-            ));
-            split_bar.inc(1);
-            continue;
-        }
+        // Convert entire file without splitting
         run_command(Command::new("ffmpeg").args([
             "-hide_banner",
             "-loglevel",
             "error",
             "-y",
-            "-ss",
-            &format!("{start:.3}"),
-            "-t",
-            &format!("{duration:.3}"),
             "-i",
             &cli.output.to_string_lossy(),
-            "-c",
-            "copy",
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            "192k",
             &out_path.to_string_lossy(),
         ]))
-        .with_context(|| format!("ffmpeg failed to split '{}'", ch.title))?;
+        .context("ffmpeg failed to convert entire video")?;
 
-        split_bar.inc(1);
+        convert_bar.finish_and_clear();
+    } else {
+        // Has chapters: split as before
+        let total = u64::try_from(chapters.len()).unwrap_or(u64::MAX);
+        let split_bar = mp.add(ProgressBar::new(total));
+        if let Ok(style) = ProgressStyle::with_template(
+            "{spinner:.green} \x1b[90m{elapsed_precise}\x1b[0m [{bar:40.cyan/blue}] {pos}/{len} {msg}",
+        ) {
+            split_bar.set_style(style.progress_chars("#>-"));
+        }
+        split_bar.set_message("Splitting audio");
+
+        if let Some(ref dest_dir) = cli.dest {
+            fs::create_dir_all(dest_dir).context("Failed to create destination directory")?;
+        }
+
+        let pad_width = compute_pad_width(cli.numbers, chapters.len());
+
+        for (index, ch) in chapters.iter().enumerate() {
+            let safe_title = sanitize(&ch.title).unwrap_or_else(|| format!("part-{}", index + 1));
+            let title_prefix = if cli.prefix_name {
+                metadata
+                    .get("title")
+                    .and_then(|t| t.as_str())
+                    .and_then(make_title_prefix)
+            } else {
+                None
+            };
+            let filename =
+                build_output_filename(cli, index, pad_width, &safe_title, title_prefix.as_deref());
+            let out_path = match &cli.dest {
+                Some(dir) => dir.join(filename),
+                None => PathBuf::from(&filename),
+            };
+
+            let start = ch.start_time.max(0.0);
+            let duration = (ch.end_time - ch.start_time).max(0.0);
+            if !duration.is_finite() || duration < 1.0 {
+                split_bar.println(format!(
+                    "\x1b[90mSkipping '{}' (<1s duration)\x1b[0m",
+                    ch.title
+                ));
+                split_bar.inc(1);
+                continue;
+            }
+            run_command(Command::new("ffmpeg").args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-ss",
+                &format!("{start:.3}"),
+                "-t",
+                &format!("{duration:.3}"),
+                "-i",
+                &cli.output.to_string_lossy(),
+                "-c",
+                "copy",
+                &out_path.to_string_lossy(),
+            ]))
+            .with_context(|| format!("ffmpeg failed to split '{}'", ch.title))?;
+
+            split_bar.inc(1);
+        }
+        split_bar.finish_and_clear();
     }
-    split_bar.finish_and_clear();
 
     if !cli.keep {
         let _ = fs::remove_file(&cli.output);
@@ -707,27 +760,60 @@ fn compute_pad_width(use_numbers: bool, count: usize) -> usize {
     }
 }
 
-fn make_title_prefix(metadata: &Value) -> Option<String> {
-    let title = metadata.get("title")?.as_str()?;
-    // cut at first delimiter among " - ", "(", "["
-    let mut cut_pos = title.len();
-    if let Some(p) = title.find(" - ") {
+fn make_title_prefix(title: &str) -> Option<String> {
+    // Remove tags in brackets at the beginning (like [FREE], [HD], etc.)
+    let mut cleaned = title;
+    loop {
+        let trimmed = cleaned.trim_start();
+        if let Some(start) = trimmed.find('[') {
+            if start == 0 {
+                if let Some(end) = trimmed.find(']') {
+                    cleaned = trimmed[end + 1..].trim_start();
+                    continue;
+                }
+            }
+        }
+        if let Some(start) = trimmed.find('(') {
+            if start == 0 {
+                if let Some(end) = trimmed.find(')') {
+                    cleaned = trimmed[end + 1..].trim_start();
+                    continue;
+                }
+            }
+        }
+        break;
+    }
+
+    // Cut at content separators like "|" or "(" (but not at beginning)
+    let mut cut_pos = cleaned.len();
+    if let Some(p) = cleaned.find(" | ") {
         cut_pos = cut_pos.min(p);
     }
-    if let Some(p) = title.find('(') {
+    if let Some(p) = cleaned.find('|') {
         cut_pos = cut_pos.min(p);
     }
-    if let Some(p) = title.find('[') {
-        cut_pos = cut_pos.min(p);
+    // Cut at brackets or parentheses that are not at the beginning
+    if let Some(p) = cleaned.find('(') {
+        if p > 0 {
+            cut_pos = cut_pos.min(p);
+        }
     }
-    let slice = &title[..cut_pos];
+    if let Some(p) = cleaned.find('[') {
+        if p > 0 {
+            cut_pos = cut_pos.min(p);
+        }
+    }
+
+    let slice = &cleaned[..cut_pos].trim();
     let lowered = slice.to_lowercase();
     let sanitized = sanitize(&lowered)?;
-    let mut chars = sanitized.chars().take(40).collect::<String>();
-    // trim trailing underscore if cut in the middle of a word boundary
+    let mut chars = sanitized.chars().take(60).collect::<String>();
+
+    // Clean up trailing underscores
     while chars.ends_with('_') {
         chars.pop();
     }
+
     if chars.is_empty() { None } else { Some(chars) }
 }
 
@@ -755,4 +841,39 @@ fn build_output_filename(
     parts.push(safe_title.to_string());
     let name = parts.join("_");
     format!("{}.{}", name, cli.audio_format)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case(
+        "[FREE] Phonk x Tyga Type Beat - Salt Shaker | Club Banger Instrumental | Club Type Beat 2024",
+        "phonk_x_tyga_type_beat_-_salt_shaker"
+    )]
+    #[case("Simple Song Name", "simple_song_name")]
+    #[case("[HD] (Official) Artist Name - Song Title", "artist_name_-_song_title")]
+    #[case("(2024) [EXCLUSIVE] Beat Name | Type Beat", "beat_name")]
+    #[case("No Tags Here", "no_tags_here")]
+    #[case("[FREE] Beat - Track Name | Producer 2024", "beat_-_track_name")]
+    #[case("Artist - Song Title (Remix)", "artist_-_song_title")]
+    #[case("Song Title [Official Video]", "song_title")]
+    #[case("Track Name (Official Audio)", "track_name")]
+    #[case("Music Title - Feat. Artist (2024)", "music_title_-_feat_artist")]
+    fn test_make_title_prefix(#[case] input: &str, #[case] expected: &str) {
+        let result = make_title_prefix(input);
+        assert_eq!(result, Some(expected.to_string()));
+    }
+
+    #[rstest]
+    #[case("")]
+    #[case("[")]
+    #[case("()")]
+    #[case("!@#$%^&*")]
+    fn test_make_title_prefix_invalid(#[case] input: &str) {
+        let result = make_title_prefix(input);
+        assert_eq!(result, None);
+    }
 }

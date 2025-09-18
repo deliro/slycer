@@ -17,3 +17,6 @@ serde_json = { version = "1.0.140", features = ["alloc"] }
 clap = { version = "4.5.20", features = ["derive"] }
 indicatif = "0.17.8"
 which = "6.0.3"
+
+[dev-dependencies]
+rstest = "0.18"
